@@ -1,3 +1,10 @@
 # One address per line. Blank lines and lines starting with '#' are ignored.
-# Extra text around each address is OK; any 0x-prefixed 40-hex address is extracted.
-0x0EA2b31F35f96a12DA3EDd76154a81ACDA731197
+# Format (either/or):
+#   <address>
+#   <address>,<token>         # per-address token (address and token separated by
+#                             # space, tab, comma, or semicolon)
+#
+# The authorization token on claim.pharos.xyz is session-bound, so for many
+# wallets you will typically use the "<address>,<token>" form.
+
+0x0EA2b31F35f96a12DA3EDd76154a81ACDA731197,mq0luhhd9a9l0268rzfcw1fubc6pj46i

@@ -7,13 +7,13 @@ Endpoint:
 Auth:
     Header "authorization: TOKEN <token>"
 
-Usage:
-    python batch_airdrop_query.py -i addresses.txt -o result.csv --token <token>
-    python batch_airdrop_query.py -a 0xabc... 0xdef... --token <token>
-    PHAROS_TOKEN=<token> python batch_airdrop_query.py -i addresses.txt
+The authorization token from claim.pharos.xyz is session-bound to a single
+wallet, so you usually need one token per address. This tool supports either:
 
-addresses.txt may contain one address per line. Blank lines and lines starting
-with '#' are ignored. Commas and whitespace are also accepted as separators.
+  - a single shared token via --token / $PHAROS_TOKEN, or
+  - per-address tokens in the input file:
+        0xabc...<tab or comma or space>TOKEN_VALUE
+    Blank lines and lines starting with '#' are ignored.
 """
 
 from __future__ import annotations
@@ -55,19 +55,48 @@ class QueryResult:
     data: dict[str, Any] = field(default_factory=dict)
 
 
-def load_addresses(path: str) -> list[str]:
-    with open(path, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    found = ADDRESS_RE.findall(text)
+def load_entries(path: str) -> list[tuple[str, str | None]]:
+    """Return (address, token-or-None) pairs from the input file.
+
+    Accepts lines like:
+        0xabc...
+        0xabc...,TOKEN
+        0xabc... TOKEN
+        0xabc...\tTOKEN
+    """
+    entries: list[tuple[str, str | None]] = []
     seen: set[str] = set()
-    unique: list[str] = []
-    for addr in found:
-        lower = addr.lower()
-        if lower in seen:
-            continue
-        seen.add(lower)
-        unique.append(addr)
-    return unique
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            match = ADDRESS_RE.search(line)
+            if not match:
+                continue
+            addr = match.group(0)
+            key = addr.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            # Everything after the address (skipping separators) is the token.
+            remainder = line[match.end():].lstrip(" \t,;").strip()
+            token = remainder or None
+            entries.append((addr, token))
+    return entries
+
+
+def build_opener(proxy: str | None) -> urllib.request.OpenerDirector:
+    handlers: list[urllib.request.BaseHandler] = []
+    if proxy:
+        handlers.append(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        )
+    else:
+        # Explicitly disable proxies unless one was requested, so we don't
+        # silently inherit a broken HTTP_PROXY from the environment.
+        handlers.append(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers)
 
 
 def build_request(address: str, token: str) -> urllib.request.Request:
@@ -86,6 +115,7 @@ def build_request(address: str, token: str) -> urllib.request.Request:
 def query_one(
     address: str,
     token: str,
+    opener: urllib.request.OpenerDirector,
     *,
     timeout: float,
     retries: int,
@@ -97,7 +127,7 @@ def query_one(
     while attempt <= retries:
         try:
             req = build_request(address, token)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with opener.open(req, timeout=timeout) as resp:
                 status = resp.status
                 body = resp.read().decode("utf-8", errors="replace")
                 try:
@@ -196,24 +226,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     src.add_argument(
         "-i",
         "--input",
-        help="Path to a file containing addresses (one per line).",
+        help="Path to a file. Each line: '<address>' or '<address><sep><token>'.",
     )
     src.add_argument(
         "-a",
         "--addresses",
         nargs="+",
-        help="Addresses to query (space separated).",
+        help="Addresses to query (space separated). Uses --token for all.",
     )
     parser.add_argument(
         "-o",
         "--output",
         default="airdrop_results.csv",
-        help="Output file path. Format is inferred from extension (.csv or .json). Default: airdrop_results.csv",
+        help="Output file path. Format inferred from extension (.csv or .json). Default: airdrop_results.csv",
     )
     parser.add_argument(
         "--token",
         default=os.environ.get("PHAROS_TOKEN", ""),
-        help="Bearer-style TOKEN value. Defaults to $PHAROS_TOKEN.",
+        help="Fallback TOKEN value when the input file has no per-address token. Defaults to $PHAROS_TOKEN.",
+    )
+    parser.add_argument(
+        "--proxy",
+        default=os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "",
+        help="HTTP(S) proxy URL, e.g. http://127.0.0.1:7890. Defaults to $HTTPS_PROXY/$HTTP_PROXY.",
     )
     parser.add_argument(
         "-c",
@@ -244,53 +279,76 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--rate",
         type=float,
         default=0.0,
-        help="Optional delay in seconds between submissions per worker (default: 0).",
+        help="Optional delay in seconds between submissions (default: 0).",
     )
     return parser.parse_args(argv)
+
+
+def resolve_entries(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Produce (address, token) pairs for every address to be queried."""
+    raw: list[tuple[str, str | None]]
+    if args.input:
+        raw = load_entries(args.input)
+    else:
+        raw = []
+        seen: set[str] = set()
+        for item in args.addresses:
+            for addr in ADDRESS_RE.findall(item):
+                key = addr.lower()
+                if key not in seen:
+                    seen.add(key)
+                    raw.append((addr, None))
+
+    resolved: list[tuple[str, str]] = []
+    missing: list[str] = []
+    for addr, tok in raw:
+        final = tok or args.token
+        if not final:
+            missing.append(addr)
+            continue
+        resolved.append((addr, final))
+
+    if missing:
+        preview = ", ".join(missing[:3]) + (" ..." if len(missing) > 3 else "")
+        print(
+            f"error: no token for {len(missing)} address(es) ({preview}). "
+            "Add tokens in the input file or pass --token / $PHAROS_TOKEN.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    return resolved
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
-    if not args.token:
-        print(
-            "error: no token provided. Pass --token or set PHAROS_TOKEN.",
-            file=sys.stderr,
-        )
-        return 2
-
-    if args.input:
-        addresses = load_addresses(args.input)
-    else:
-        seen: set[str] = set()
-        addresses = []
-        for raw in args.addresses:
-            for addr in ADDRESS_RE.findall(raw):
-                key = addr.lower()
-                if key not in seen:
-                    seen.add(key)
-                    addresses.append(addr)
-
-    if not addresses:
+    entries = resolve_entries(args)
+    if not entries:
         print("error: no valid addresses found.", file=sys.stderr)
         return 2
 
+    opener = build_opener(args.proxy or None)
+
+    via = f" via {args.proxy}" if args.proxy else ""
     print(
-        f"Querying {len(addresses)} address(es) with concurrency={args.concurrency}...",
+        f"Querying {len(entries)} address(es) with concurrency={args.concurrency}{via}...",
         file=sys.stderr,
     )
 
     results: list[QueryResult] = []
     ok_count = 0
     fail_count = 0
+    t0 = time.time()
 
     with cf.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
         future_to_addr = {}
-        for addr in addresses:
+        for addr, token in entries:
             future = pool.submit(
                 query_one,
                 addr,
-                args.token,
+                token,
+                opener,
                 timeout=args.timeout,
                 retries=args.retries,
                 backoff=args.backoff,
@@ -309,12 +367,12 @@ def main(argv: list[str] | None = None) -> int:
                 fail_count += 1
                 status_label = f"FAIL({result.status or 'ERR'})"
             print(
-                f"[{ok_count + fail_count}/{len(addresses)}] {result.address} {status_label}",
+                f"[{ok_count + fail_count}/{len(entries)}] {result.address} {status_label}",
                 file=sys.stderr,
             )
 
     # Keep output order aligned with input order.
-    order = {addr: i for i, addr in enumerate(addresses)}
+    order = {addr: i for i, (addr, _) in enumerate(entries)}
     results.sort(key=lambda r: order.get(r.address, 1 << 30))
 
     ext = os.path.splitext(args.output)[1].lower()
@@ -323,8 +381,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         write_csv(results, args.output)
 
+    elapsed = time.time() - t0
     print(
-        f"Done. ok={ok_count} fail={fail_count} output={args.output}",
+        f"Done. ok={ok_count} fail={fail_count} elapsed={elapsed:.1f}s output={args.output}",
         file=sys.stderr,
     )
     return 0 if fail_count == 0 else 1

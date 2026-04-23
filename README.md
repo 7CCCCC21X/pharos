@@ -7,42 +7,69 @@ GET https://api.claim.pharos.xyz/airdrop/airdrop_info?address=<addr>
 authorization: TOKEN <token>
 ```
 
+The token is session-bound to one wallet, so for multi-wallet batches you
+usually supply one token per address.
+
 ## Requirements
 
-- Python 3.9+ (uses standard library only — no pip install required)
+- Python 3.9+ (standard library only, no `pip install` needed)
+
+## Input formats
+
+**One address per line (use a single shared token):**
+
+```
+0x0EA2b31F35f96a12DA3EDd76154a81ACDA731197
+0xabc...
+```
+
+**Per-address token** (separator can be space, tab, comma, or semicolon):
+
+```
+0x0EA2b31F35f96a12DA3EDd76154a81ACDA731197,mq0luhhd9a9l0268rzfcw1fubc6pj46i
+0xabc...,<token-for-abc>
+0xdef... <token-for-def>
+```
+
+Blank lines and `#` comment lines are ignored.
 
 ## Usage
 
 ```bash
-# From a file of addresses (one per line)
+# File with per-address tokens
+python batch_airdrop_query.py -i wallets.txt -o result.csv
+
+# File with just addresses, shared token via env var
 PHAROS_TOKEN=mq0luhhd9a9l0268rzfcw1fubc6pj46i \
   python batch_airdrop_query.py -i addresses.txt -o result.csv
 
-# Addresses on the command line
+# Ad-hoc addresses on the command line
 python batch_airdrop_query.py \
   --token mq0luhhd9a9l0268rzfcw1fubc6pj46i \
-  -a 0x0EA2b31F35f96a12DA3EDd76154a81ACDA731197 0xabc...
+  -a 0x0EA2b31F35f96a12DA3EDd76154a81ACDA731197
 
-# JSON output
-python batch_airdrop_query.py -i addresses.txt -o result.json
+# Through a local HTTP proxy (same as the browser trace)
+python batch_airdrop_query.py -i wallets.txt --proxy http://127.0.0.1:7890
 
-# Tune concurrency / retries / timeout
-python batch_airdrop_query.py -i addresses.txt -c 10 --retries 5 --timeout 20
+# JSON output, tuned concurrency / retries / timeout
+python batch_airdrop_query.py -i wallets.txt -o result.json \
+  -c 10 --retries 5 --timeout 20 --rate 0.1
 ```
 
 ## Options
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-i, --input` | — | File with one address per line (blank/`#` lines ignored) |
-| `-a, --addresses` | — | Addresses passed on the command line |
+| `-i, --input` | — | File with `<address>` or `<address><sep><token>` per line |
+| `-a, --addresses` | — | Addresses on the command line (uses `--token`) |
 | `-o, --output` | `airdrop_results.csv` | Output path. `.csv` or `.json` inferred from extension |
-| `--token` | `$PHAROS_TOKEN` | `authorization: TOKEN <value>` header |
+| `--token` | `$PHAROS_TOKEN` | Fallback token when the input file has no per-address token |
+| `--proxy` | `$HTTPS_PROXY`/`$HTTP_PROXY` | HTTP(S) proxy URL, e.g. `http://127.0.0.1:7890` |
 | `-c, --concurrency` | `5` | Parallel workers |
 | `--timeout` | `15` | Per-request timeout (s) |
 | `--retries` | `3` | Retries for network / 5xx / 429 failures |
 | `--backoff` | `1.0` | Initial retry backoff (s), doubles each attempt |
-| `--rate` | `0` | Optional submission delay per worker (s) |
+| `--rate` | `0` | Optional submission delay between requests (s) |
 
 ## Output
 
@@ -66,4 +93,4 @@ Nested objects/arrays are JSON-encoded inside their cell.
 ```
 
 Exit code is `0` when every address succeeded, `1` if any failed, `2` for
-argument/setup errors.
+argument / setup errors.

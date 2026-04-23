@@ -6,4 +6,7 @@ venv/
 .env
 airdrop_results.csv
 airdrop_results.json
+airdrop_results.csv.jsonl
+airdrop_results.json.jsonl
+*.jsonl
 addresses.txt

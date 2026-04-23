@@ -70,6 +70,22 @@ python batch_airdrop_query.py -i wallets.txt -o result.json \
 | `--retries` | `3` | Retries for network / 5xx / 429 failures |
 | `--backoff` | `1.0` | Initial retry backoff (s), doubles each attempt |
 | `--rate` | `0` | Optional submission delay between requests (s) |
+| `--checkpoint` | `<output>.jsonl` | JSONL file where each completed result is appended live |
+| `--resume` | off | Skip addresses already saved as `ok=true` in the checkpoint |
+
+### Checkpoint / resume
+
+Every completed address is appended to the checkpoint as a single JSON line as
+soon as it finishes, so a long batch can survive Ctrl+C, network outages, or
+process kills. To continue where you left off:
+
+```bash
+python batch_airdrop_query.py -i wallets.txt -o result.csv --resume
+```
+
+Addresses that already have `ok=true` in the checkpoint are skipped (their
+cached data flows through to the final CSV/JSON). Addresses that previously
+failed are retried.
 
 ## Output
 
@@ -94,3 +110,11 @@ Nested objects/arrays are JSON-encoded inside their cell.
 
 Exit code is `0` when every address succeeded, `1` if any failed, `2` for
 argument / setup errors.
+
+## Tests
+
+Pure standard library, no external runner needed:
+
+```bash
+python -m unittest test_batch_airdrop_query -v
+```

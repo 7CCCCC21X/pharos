@@ -26,6 +26,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -218,6 +219,70 @@ def write_json(results: list[QueryResult], path: str) -> None:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
 
 
+def result_to_dict(result: QueryResult) -> dict[str, Any]:
+    return {
+        "address": result.address,
+        "ok": result.ok,
+        "status": result.status,
+        "error": result.error,
+        "data": result.data,
+    }
+
+
+def result_from_dict(payload: dict[str, Any]) -> QueryResult:
+    return QueryResult(
+        address=payload.get("address", ""),
+        ok=bool(payload.get("ok", False)),
+        status=int(payload.get("status", 0) or 0),
+        error=str(payload.get("error", "") or ""),
+        data=payload.get("data", {}) or {},
+    )
+
+
+def load_checkpoint(path: str) -> dict[str, QueryResult]:
+    """Read a JSONL checkpoint, returning {lowercase_address: QueryResult}.
+
+    Later entries for the same address replace earlier ones. Missing file is
+    treated as an empty checkpoint.
+    """
+    by_addr: dict[str, QueryResult] = {}
+    if not os.path.exists(path):
+        return by_addr
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            result = result_from_dict(payload)
+            if result.address:
+                by_addr[result.address.lower()] = result
+    return by_addr
+
+
+class CheckpointWriter:
+    """Append-only JSONL sink that's safe to share across worker threads."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._fh = open(path, "a", encoding="utf-8")
+
+    def append(self, result: QueryResult) -> None:
+        line = json.dumps(result_to_dict(result), ensure_ascii=False)
+        with self._lock:
+            self._fh.write(line + "\n")
+            self._fh.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._fh.closed:
+                self._fh.close()
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Batch query Pharos airdrop_info for a list of addresses.",
@@ -281,6 +346,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=0.0,
         help="Optional delay in seconds between submissions (default: 0).",
     )
+    parser.add_argument(
+        "--checkpoint",
+        default="",
+        help="Path to a JSONL checkpoint file. Each completed result is appended as it finishes. Defaults to <output>.jsonl.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip addresses already recorded as ok=true in the checkpoint and reuse their data in the final output.",
+    )
     return parser.parse_args(argv)
 
 
@@ -330,46 +405,71 @@ def main(argv: list[str] | None = None) -> int:
 
     opener = build_opener(args.proxy or None)
 
-    via = f" via {args.proxy}" if args.proxy else ""
-    print(
-        f"Querying {len(entries)} address(es) with concurrency={args.concurrency}{via}...",
-        file=sys.stderr,
+    checkpoint_path = args.checkpoint or f"{args.output}.jsonl"
+    prior: dict[str, QueryResult] = (
+        load_checkpoint(checkpoint_path) if args.resume else {}
     )
+    reused: list[QueryResult] = []
+    pending: list[tuple[str, str]] = []
+    for addr, token in entries:
+        cached = prior.get(addr.lower())
+        if cached and cached.ok:
+            reused.append(cached)
+        else:
+            pending.append((addr, token))
 
-    results: list[QueryResult] = []
-    ok_count = 0
+    via = f" via {args.proxy}" if args.proxy else ""
+    if reused:
+        print(
+            f"Resuming: {len(reused)} cached ok, {len(pending)} to query{via}.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Querying {len(pending)} address(es) with concurrency={args.concurrency}{via}...",
+            file=sys.stderr,
+        )
+
+    writer = CheckpointWriter(checkpoint_path)
+    results: list[QueryResult] = list(reused)
+    ok_count = sum(1 for r in reused if r.ok)
     fail_count = 0
+    total = len(pending) + len(reused)
     t0 = time.time()
 
-    with cf.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
-        future_to_addr = {}
-        for addr, token in entries:
-            future = pool.submit(
-                query_one,
-                addr,
-                token,
-                opener,
-                timeout=args.timeout,
-                retries=args.retries,
-                backoff=args.backoff,
-            )
-            future_to_addr[future] = addr
-            if args.rate > 0:
-                time.sleep(args.rate)
+    try:
+        with cf.ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
+            future_to_addr = {}
+            for addr, token in pending:
+                future = pool.submit(
+                    query_one,
+                    addr,
+                    token,
+                    opener,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                    backoff=args.backoff,
+                )
+                future_to_addr[future] = addr
+                if args.rate > 0:
+                    time.sleep(args.rate)
 
-        for future in cf.as_completed(future_to_addr):
-            result = future.result()
-            results.append(result)
-            if result.ok:
-                ok_count += 1
-                status_label = "OK"
-            else:
-                fail_count += 1
-                status_label = f"FAIL({result.status or 'ERR'})"
-            print(
-                f"[{ok_count + fail_count}/{len(entries)}] {result.address} {status_label}",
-                file=sys.stderr,
-            )
+            for future in cf.as_completed(future_to_addr):
+                result = future.result()
+                results.append(result)
+                writer.append(result)
+                if result.ok:
+                    ok_count += 1
+                    status_label = "OK"
+                else:
+                    fail_count += 1
+                    status_label = f"FAIL({result.status or 'ERR'})"
+                print(
+                    f"[{ok_count + fail_count}/{total}] {result.address} {status_label}",
+                    file=sys.stderr,
+                )
+    finally:
+        writer.close()
 
     # Keep output order aligned with input order.
     order = {addr: i for i, (addr, _) in enumerate(entries)}
@@ -383,7 +483,8 @@ def main(argv: list[str] | None = None) -> int:
 
     elapsed = time.time() - t0
     print(
-        f"Done. ok={ok_count} fail={fail_count} elapsed={elapsed:.1f}s output={args.output}",
+        f"Done. ok={ok_count} fail={fail_count} elapsed={elapsed:.1f}s "
+        f"output={args.output} checkpoint={checkpoint_path}",
         file=sys.stderr,
     )
     return 0 if fail_count == 0 else 1
